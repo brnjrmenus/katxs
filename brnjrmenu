@@ -1,0 +1,1919 @@
+--[[
+    Shop Tween  |  KAT X
+    Auto-detects ShopModel pickups in Workspace.WorldIgnore.Pickups and tweens
+    your character to them, optionally travelling just beneath the map surface.
+
+    Includes: respawn-safe automation + lightweight Anti-AFK,
+    plus a Player tab (ESP / WalkSpeed / JumpPower / Infinite Jump) and a crate counter.
+]]
+
+-- // Services
+local Players          = game:GetService("Players")
+local TweenService     = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
+local RunService       = game:GetService("RunService")
+local Workspace        = game:GetService("Workspace")
+local CoreGui          = game:GetService("CoreGui")
+
+local LocalPlayer = Players.LocalPlayer
+while not LocalPlayer do
+    task.wait()
+    LocalPlayer = Players.LocalPlayer
+end
+
+-- // Re-execution guard (removes the previous instance)
+local env = (getgenv and getgenv()) or _G
+if env.__ShopTweenKATX and type(env.__ShopTweenKATX.Destroy) == "function" then
+    pcall(env.__ShopTweenKATX.Destroy)
+end
+
+-- // Config
+local CONFIG = {
+    TargetName     = "ShopModel",
+    MinSpeed       = 10,
+    MaxSpeed       = 300,
+    DefaultSpeed   = 80,
+    SpeedStep      = 5,
+
+    DefaultDepth   = 3,      -- studs below the surface
+    MinDepth       = 0.5,
+    MaxDepth       = 50,
+    DepthStep      = 0.1,
+
+    SegmentLength  = 20,     -- horizontal studs per tween segment (surface is re-sampled each segment)
+    ArriveRadius   = 1,      -- horizontal distance at which we consider ourselves under the target
+    RayHeadroom    = 12,     -- surface samples start this far above the last known surface
+    RayDepth       = 300,    -- how far down surface rays reach
+
+    FinalOffset    = Vector3.new(0, 3, 0), -- where you end up relative to the model's pivot
+    DwellTime      = 0.35,
+    IdleInterval   = 0.2,
+    ScanInterval   = 1,
+    StartEnabled   = false,
+
+    -- Respawn handling
+    PostSpawnDelay     = 3,     -- seconds to wait AFTER the new character is genuinely ready
+    ReadyStableTime    = 0.5,   -- character must look "ready" continuously for this long first
+    ReadyMoveTolerance = 10,    -- a position jump bigger than this (studs per poll) restarts the stable timer
+    ReadyPollInterval  = 0.1,   -- how often the respawn waiter checks (cheap polling)
+    RequireUnanchored  = true,  -- treat an anchored HumanoidRootPart as "still in the respawn box"
+
+    -- Anti-AFK
+    AntiAFK            = true,
+    AntiAFKStopOnClose = false, -- false = Anti-AFK keeps running after you close the window
+
+    -- Collection counter
+    CollectRadius        = 12,  -- horizontal studs: a removal during the approach only counts if you're this close
+    CollectConfirmWindow = 1.5, -- seconds after arriving (+ dwell) in which the model's removal still counts
+
+    -- Player tab
+    MinWalkSpeed     = 8,
+    MaxWalkSpeed     = 200,
+    DefaultWalkSpeed = 16,
+    MinJumpPower     = 10,
+    MaxJumpPower     = 250,
+    DefaultJumpPower = 50,
+    ESPFill          = Color3.fromRGB(124, 108, 255),
+    ESPOutline       = Color3.fromRGB(255, 255, 255),
+    ESPFillAlpha     = 0.55,
+}
+
+-- // Anti-AFK (independent of everything below; one connection, replaced on re-execute)
+local function startAntiAFK()
+    local old = env.__ShopTweenKATXAntiAFK
+    if old and type(old.Disconnect) == "function" then
+        pcall(old.Disconnect)
+    end
+    env.__ShopTweenKATXAntiAFK = nil
+    if not CONFIG.AntiAFK then return nil end
+
+    local okVU, VirtualUser = pcall(function() return game:GetService("VirtualUser") end)
+    if not okVU or not VirtualUser then
+        warn("[ShopTween] VirtualUser unavailable - Anti-AFK disabled")
+        return nil
+    end
+
+    local conn = LocalPlayer.Idled:Connect(function()
+        -- Event-driven: only runs when Roblox reports the player as idle. No movement, no teleporting.
+        pcall(function()
+            VirtualUser:CaptureController()
+            VirtualUser:ClickButton2(Vector2.new(0, 0))
+        end)
+    end)
+
+    local handle = {}
+    function handle.Disconnect()
+        pcall(function() conn:Disconnect() end)
+        if env.__ShopTweenKATXAntiAFK == handle then
+            env.__ShopTweenKATXAntiAFK = nil
+        end
+    end
+    env.__ShopTweenKATXAntiAFK = handle
+    return handle
+end
+
+local antiAFK = startAntiAFK()
+
+-- // Settings persisted while the script is running (survive re-execution too)
+local saved = env.__ShopTweenKATXSettings
+if type(saved) ~= "table" then
+    saved = {}
+    env.__ShopTweenKATXSettings = saved
+end
+
+local function snapValue(v, minV, maxV, step)
+    local k = math.floor((v - minV) / step + 0.5)
+    v = math.clamp(minV + k * step, minV, maxV)
+    return math.floor(v * 1000 + 0.5) / 1000
+end
+
+local function numOr(v, default)
+    return type(v) == "number" and v == v and v or default
+end
+
+-- // State
+local State = {
+    enabled      = false,   -- the user's ON/OFF choice (never changed by respawns)
+    paused       = false,   -- true while respawning: nothing is allowed to target/move
+    respawnText  = nil,
+    underMap     = saved.underMap ~= false,
+    autoTarget   = saved.autoTarget ~= false,
+    speed        = snapValue(numOr(saved.speed, CONFIG.DefaultSpeed), CONFIG.MinSpeed, CONFIG.MaxSpeed, CONFIG.SpeedStep),
+    depth        = snapValue(numOr(saved.depth, CONFIG.DefaultDepth), CONFIG.MinDepth, CONFIG.MaxDepth, CONFIG.DepthStep),
+    depthVersion = 0,       -- bumped whenever the depth slider changes
+    token        = 0,       -- invalidates old automation loops / tween waits
+    tween        = nil,
+    current      = nil,
+    phase        = nil,
+    underground  = false,
+    surfaceY     = nil,     -- last sampled surface height at the character's position
+    manualOnce   = false,
+    destroyed    = false,
+    notice       = "",
+    noticeUntil  = 0,
+
+    -- Player tab / counter (nil walkSpeed / jumpPower = "never touched, leave the game's value alone")
+    collected    = math.max(math.floor(numOr(saved.collected, 0)), 0),
+    walkSpeed    = type(saved.walkSpeed) == "number" and math.clamp(saved.walkSpeed, CONFIG.MinWalkSpeed, CONFIG.MaxWalkSpeed) or nil,
+    jumpPower    = type(saved.jumpPower) == "number" and math.clamp(saved.jumpPower, CONFIG.MinJumpPower, CONFIG.MaxJumpPower) or nil,
+    infJump      = saved.infJump == true,
+    esp          = saved.esp == true,
+}
+
+-- Respawn bookkeeping
+local respawn = {
+    session  = 0,                              -- bumped to cancel the active waiter (Destroy)
+    waiting  = false,                          -- true while exactly one waiter is running
+    bindId   = 0,                              -- guards async Humanoid binding
+    diedConn = nil,                            -- Humanoid.Died of the current character
+    dead     = setmetatable({}, { __mode = "k" }), -- characters known to be dead/removed
+}
+
+local function saveSettings()
+    saved.speed      = State.speed
+    saved.depth      = State.depth
+    saved.underMap   = State.underMap
+    saved.autoTarget = State.autoTarget
+    saved.collected  = State.collected
+    saved.walkSpeed  = State.walkSpeed
+    saved.jumpPower  = State.jumpPower
+    saved.infJump    = State.infJump
+    saved.esp        = State.esp
+end
+
+local pending      = {}
+local pendingCount = 0
+local visited      = setmetatable({}, { __mode = "k" })
+local modelConns   = {}
+local scanConns    = {}
+local scanFolder   = nil
+local scanToken    = 0
+local coreConns    = {}
+
+-- // Helpers
+-- Automation may only act while enabled, not respawning, and on the current token.
+local function alive(token)
+    return not State.destroyed and State.enabled and not State.paused and token == State.token
+end
+
+local function notify(msg)
+    State.notice = msg
+    State.noticeUntil = os.clock() + 2.5
+end
+
+local function getCharacter()
+    local char = LocalPlayer.Character
+    if not char or respawn.dead[char] then return nil end
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    if not hrp or not hrp:IsA("BasePart") or not hum or hum.Health <= 0 then return nil end
+    return hrp, hum, char
+end
+
+local function getTargetPosition(model)
+    if not model then return nil end
+    if model:IsA("BasePart") then return model.Position end
+    if not model:FindFirstChildWhichIsA("BasePart", true) then return nil end
+    local ok, cf = pcall(function() return model:GetPivot() end)
+    if ok and typeof(cf) == "CFrame" then return cf.Position end
+    return nil
+end
+
+local function isValid(model)
+    return scanFolder ~= nil and model.Parent ~= nil and model:IsDescendantOf(scanFolder)
+end
+
+local function floorLimit()
+    return Workspace.FallenPartsDestroyHeight + 15
+end
+
+-- Height the character travels at for a given surface height (never above the surface)
+local function travelY(surface)
+    local y = math.max(surface - State.depth, floorLimit())
+    return math.min(y, surface - CONFIG.MinDepth)
+end
+
+-- // Surface detection (raycasts ignore your character, other players, the camera and WorldIgnore)
+local rayParams = RaycastParams.new()
+rayParams.FilterType = Enum.RaycastFilterType.Exclude
+rayParams.IgnoreWater = true
+pcall(function() rayParams.RespectCanCollide = true end)
+
+local function refreshRayFilter(char)
+    local list = {}
+    if char then list[#list + 1] = char end
+    local wi = Workspace:FindFirstChild("WorldIgnore")
+    if wi then list[#list + 1] = wi end
+    if Workspace.CurrentCamera then list[#list + 1] = Workspace.CurrentCamera end
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= LocalPlayer and plr.Character then list[#list + 1] = plr.Character end
+    end
+    rayParams.FilterDescendantsInstances = list
+end
+
+-- Ground under the character (cast from the root part itself, so roofs above are ignored)
+local function groundBelow(hrp, hum, char)
+    refreshRayFilter(char)
+    local res = Workspace:Raycast(hrp.Position, Vector3.new(0, -CONFIG.RayDepth, 0), rayParams)
+    if res then return res.Position.Y end
+    local hip = (hum and hum.HipHeight > 0) and hum.HipHeight or 2
+    return hrp.Position.Y - (hip + hrp.Size.Y / 2)
+end
+
+-- Surface at (x, z), starting just above the previous surface so roofs/ceilings higher up are ignored
+local function sampleSurface(x, z, ref, char)
+    refreshRayFilter(char)
+    local origin = Vector3.new(x, ref + CONFIG.RayHeadroom, z)
+    local res = Workspace:Raycast(origin, Vector3.new(0, -(CONFIG.RayHeadroom + CONFIG.RayDepth), 0), rayParams)
+    if res then return res.Position.Y end
+    return ref
+end
+
+-- // Pending queue
+local function removePending(model)
+    if pending[model] then
+        pending[model] = nil
+        pendingCount = math.max(pendingCount - 1, 0)
+    end
+end
+
+local function addPending(model)
+    if not pending[model] then
+        pending[model] = true
+        pendingCount += 1
+    end
+end
+
+-- // Tween control
+local function cancelTween()
+    local t = State.tween
+    State.tween = nil
+    if t then pcall(function() t:Cancel() end) end
+end
+
+-- // Movement controller (noclip, zero velocity, position hold between tweens)
+local move = { conn = nil, parts = nil, hum = nil, hrp = nil, wasPlatform = false, hold = nil }
+
+local function endMovement()
+    if move.conn then move.conn:Disconnect() move.conn = nil end
+    move.hold = nil
+    if move.parts then
+        for part, orig in pairs(move.parts) do
+            if part.Parent then pcall(function() part.CanCollide = orig end) end
+        end
+    end
+    if move.hum and move.hum.Parent then
+        pcall(function() move.hum.PlatformStand = move.wasPlatform end)
+    end
+    if move.hrp and move.hrp.Parent then
+        pcall(function()
+            move.hrp.AssemblyLinearVelocity = Vector3.zero
+            move.hrp.AssemblyAngularVelocity = Vector3.zero
+        end)
+    end
+    move.parts, move.hum, move.hrp = nil, nil, nil
+end
+
+local function holdHere(hrp)
+    if move.hrp == hrp and hrp.Parent then move.hold = hrp.CFrame end
+end
+
+local function beginMovement(char, hrp, hum)
+    if move.conn and move.hrp == hrp then return end
+    endMovement()
+    move.parts = {}
+    for _, d in ipairs(char:GetDescendants()) do
+        if d:IsA("BasePart") then
+            move.parts[d] = d.CanCollide
+            d.CanCollide = false
+        end
+    end
+    move.hum, move.hrp = hum, hrp
+    move.wasPlatform = hum.PlatformStand
+    move.hold = hrp.CFrame
+    hum.PlatformStand = true
+    move.conn = RunService.Stepped:Connect(function(_, dt)
+        local parts = move.parts
+        if parts then
+            for part in pairs(parts) do part.CanCollide = false end
+        end
+        if not hrp.Parent then return end
+        hrp.AssemblyLinearVelocity = Vector3.zero
+        hrp.AssemblyAngularVelocity = Vector3.zero
+
+        -- Between tweens: stay put (no gravity drift). While idle underground, follow the depth slider live.
+        if State.tween == nil and move.hold then
+            local hold = move.hold
+            if State.underground and State.underMap and State.surfaceY then
+                local dy = travelY(State.surfaceY) - hold.Position.Y
+                if math.abs(dy) > 0.01 then
+                    local stepY = math.clamp(dy, -State.speed * dt, State.speed * dt)
+                    hold = hold + Vector3.new(0, stepY, 0)
+                    move.hold = hold
+                end
+            end
+            hrp.CFrame = hold
+        end
+    end)
+end
+
+-- Safety: if stopped while under the map, lift the character back above the surface
+local function rescue()
+    if not State.underground then return end
+    local hrp = move.hrp or getCharacter()
+    if hrp and hrp.Parent then
+        pcall(function()
+            local p = hrp.Position
+            local rot = hrp.CFrame - p
+            local y = math.max((State.surfaceY or p.Y) + 3, p.Y)
+            hrp.CFrame = CFrame.new(p.X, y, p.Z) * rot
+        end)
+    end
+    move.hold = nil
+    State.underground = false
+end
+
+local function resetMovementState()
+    cancelTween()
+    endMovement()
+    State.underground = false
+    State.surfaceY = nil
+end
+
+-- // Single tween segment. Returns "done" | "retarget" | "stopped"
+local function tweenTo(hrp, pos, token, watchDepth)
+    if not alive(token) or not hrp.Parent then return "stopped" end
+
+    local current = hrp.CFrame
+    local goal = CFrame.new(pos) * (current - current.Position)
+    local dist = (current.Position - pos).Magnitude
+    if dist < 0.25 then
+        hrp.CFrame = goal
+        holdHere(hrp)
+        return "done"
+    end
+
+    local duration = math.max(dist / math.max(State.speed, 1), 0.03)
+    cancelTween()
+    local tween = TweenService:Create(hrp, TweenInfo.new(duration, Enum.EasingStyle.Linear), { CFrame = goal })
+    State.tween = tween
+
+    local finished, result, retarget = false, nil, false
+    local conn = tween.Completed:Connect(function(s)
+        finished, result = true, s
+    end)
+    local ver = State.depthVersion
+    tween:Play()
+
+    local t0 = os.clock()
+    while not finished do
+        if not alive(token) or not hrp.Parent or os.clock() - t0 > duration + 2 then break end
+        if watchDepth and State.depthVersion ~= ver then retarget = true break end
+        task.wait()
+    end
+    conn:Disconnect()
+
+    if not finished then pcall(function() tween:Cancel() end) end
+    if State.tween == tween then State.tween = nil end
+    holdHere(hrp)
+
+    if retarget then return "retarget" end
+    -- A finished tween from an invalidated run (death/respawn/toggle) must not count as success
+    if not alive(token) then return "stopped" end
+    if finished and result == Enum.PlaybackState.Completed then return "done" end
+    return "stopped"
+end
+
+local function waitAlive(seconds, token)
+    local t0 = os.clock()
+    while alive(token) and os.clock() - t0 < seconds do
+        task.wait(0.05)
+    end
+end
+
+-- // Underground travel
+-- 1) dive to (surface - depth)  2) glide horizontally in short segments, re-sampling the surface each segment
+local function travelUnder(hrp, model, token)
+    local char = hrp.Parent
+
+    State.phase = "Diving"
+    while alive(token) do
+        local p = hrp.Position
+        local r = tweenTo(hrp, Vector3.new(p.X, travelY(State.surfaceY), p.Z), token, true)
+        if r == "done" then break end
+        if r == "stopped" then return false end
+        -- "retarget": depth changed, recompute and go again
+    end
+
+    State.phase = "Travelling underground"
+    while alive(token) do
+        if not hrp.Parent then return false end
+        local tp = getTargetPosition(model)
+        if not tp then return false end
+
+        local p = hrp.Position
+        local flat = Vector3.new(tp.X - p.X, 0, tp.Z - p.Z)
+        local dist = flat.Magnitude
+        if dist <= CONFIG.ArriveRadius then break end
+
+        local step = math.min(dist, CONFIG.SegmentLength)
+        local nx = p.X + flat.X / dist * step
+        local nz = p.Z + flat.Z / dist * step
+
+        State.surfaceY = sampleSurface(nx, nz, State.surfaceY, char)
+        local r = tweenTo(hrp, Vector3.new(nx, travelY(State.surfaceY), nz), token, true)
+        if r == "stopped" then return false end
+        -- "done" or "retarget": loop again from the actual position
+    end
+    return alive(token)
+end
+
+-- // Collection counter
+-- A crate is counted ONLY when the exact ShopModel our automation was collecting is confirmed removed
+-- from Workspace. Each armed model gets its own AncestryChanged watch (no global DescendantRemoving).
+--   arm()         : final approach to the model begins (called from processTarget)
+--   markReached() : the final tween finished, i.e. we are physically on the pickup
+--   settle()      : the attempt ended without reaching it (short grace for in-flight removal events)
+-- Unreached watches only count if the automation is still live AND the character is near the model.
+-- Reached watches count for DwellTime + CollectConfirmWindow (covers replication lag after we move on).
+local Collect = {
+    watches  = {},                                  -- [model] = { token, pos, reached, expires, conn }
+    counted  = setmetatable({}, { __mode = "k" }),  -- a model can never be counted twice
+    onChange = nil,                                 -- set by the UI
+}
+
+function Collect.drop(model)
+    local w = Collect.watches[model]
+    if w then
+        Collect.watches[model] = nil
+        if w.conn then pcall(function() w.conn:Disconnect() end) end
+    end
+end
+
+function Collect.expire(model, w, after)
+    w.expires = os.clock() + after
+    task.delay(after, function()
+        if Collect.watches[model] == w then Collect.drop(model) end
+    end)
+end
+
+function Collect.near(model, w)
+    local hrp = getCharacter()
+    local pos = getTargetPosition(model) or w.pos
+    if not hrp or not pos then return false end
+    local p = hrp.Position
+    return Vector3.new(p.X - pos.X, 0, p.Z - pos.Z).Magnitude <= CONFIG.CollectRadius
+end
+
+function Collect.confirm(model, w)
+    if Collect.watches[model] ~= w then return end
+    if model:IsDescendantOf(Workspace) then return end -- only moved around inside Workspace: not removed
+    local valid = os.clock() <= w.expires
+    local ok = valid and (w.reached or (alive(w.token) and Collect.near(model, w)))
+    Collect.drop(model)
+    if not ok or Collect.counted[model] then return end
+    Collect.counted[model] = true
+    State.collected += 1
+    saveSettings()
+    if Collect.onChange then pcall(Collect.onChange, true) end
+end
+
+function Collect.arm(model, token)
+    if Collect.counted[model] then return end
+    Collect.drop(model)
+    local w = { token = token, pos = getTargetPosition(model), reached = false, expires = math.huge }
+    Collect.watches[model] = w
+    w.conn = model.AncestryChanged:Connect(function()
+        Collect.confirm(model, w)
+    end)
+end
+
+function Collect.markReached(model)
+    local w = Collect.watches[model]
+    if not w then return end
+    w.reached = true
+    Collect.expire(model, w, CONFIG.DwellTime + CONFIG.CollectConfirmWindow)
+end
+
+function Collect.settle(model)
+    local w = Collect.watches[model]
+    if w and not w.reached and w.expires == math.huge then
+        Collect.expire(model, w, 0.5)
+    end
+end
+
+function Collect.disarmAll()
+    for model in pairs(Collect.watches) do Collect.drop(model) end
+end
+
+-- // Target processing
+local function processTarget(model, token)
+    local hrp, hum, char = getCharacter()
+    if not hrp then return false end
+    local pos = getTargetPosition(model)
+    if not pos then return true end
+
+    beginMovement(char, hrp, hum)
+
+    if State.underMap then
+        if not State.underground then
+            State.surfaceY = groundBelow(hrp, hum, char)
+            State.underground = true
+        end
+        if not travelUnder(hrp, model, token) then return false end
+
+        local p2 = getTargetPosition(model)
+        if not p2 then return false end
+        State.phase = "Surfacing"
+        Collect.arm(model, token)
+        if tweenTo(hrp, p2 + CONFIG.FinalOffset, token, false) ~= "done" then return false end
+        Collect.markReached(model)
+        State.underground = false
+    else
+        if State.underground then
+            -- Under Map Mode was switched off while underground: come back up first
+            State.phase = "Surfacing"
+            local p = hrp.Position
+            local y = math.max((State.surfaceY or p.Y) + CONFIG.FinalOffset.Y, p.Y)
+            if tweenTo(hrp, Vector3.new(p.X, y, p.Z), token, false) ~= "done" then return false end
+            State.underground = false
+        end
+        State.phase = "Travelling"
+        local p2 = getTargetPosition(model)
+        if not p2 then return false end
+        Collect.arm(model, token)
+        if tweenTo(hrp, p2 + CONFIG.FinalOffset, token, false) ~= "done" then return false end
+        Collect.markReached(model)
+    end
+
+    State.phase = "Collecting"
+    waitAlive(CONFIG.DwellTime, token)
+    if not State.underground and alive(token) then endMovement() end
+    return alive(token)
+end
+
+local function pickNearest()
+    local hrp = getCharacter()
+    local origin = hrp and hrp.Position
+    local best, bestDist
+    for model in pairs(pending) do
+        if not isValid(model) then
+            removePending(model)
+        else
+            local pos = getTargetPosition(model)
+            if pos then
+                local d = origin and (pos - origin).Magnitude or 0
+                if not bestDist or d < bestDist then
+                    best, bestDist = model, d
+                end
+            end
+        end
+    end
+    return best
+end
+
+local function mainLoop(token)
+    while alive(token) do
+        local target
+        if State.autoTarget or State.manualOnce then
+            target = pickNearest()
+            if State.manualOnce then
+                State.manualOnce = false
+                if not target then notify("No ShopModel available") end
+            end
+        end
+
+        if not target then
+            State.phase = nil
+            task.wait(CONFIG.IdleInterval)
+        else
+            State.current = target
+            removePending(target)
+            visited[target] = true
+
+            local ok, completed = pcall(processTarget, target, token)
+            if not ok then
+                warn("[ShopTween] " .. tostring(completed))
+                completed = false
+            end
+            Collect.settle(target)
+
+            -- Only touch shared state if this loop is still the current one
+            if token == State.token then
+                State.current = nil
+                State.phase = nil
+            end
+            if not alive(token) then return end
+
+            -- Interrupted (character not ready etc.) but still exists: put it back in the queue
+            if not completed and isValid(target) then
+                visited[target] = nil
+                addPending(target)
+                task.wait(0.3)
+            end
+        end
+    end
+end
+
+-- // Scanner (detects existing + newly spawned ShopModels)
+local function registerModel(inst)
+    if inst.Name ~= CONFIG.TargetName then return end
+    if not (inst:IsA("Model") or inst:IsA("BasePart")) then return end
+    if visited[inst] or pending[inst] then return end
+
+    addPending(inst)
+    if not modelConns[inst] then
+        modelConns[inst] = inst.AncestryChanged:Connect(function()
+            if not isValid(inst) then
+                removePending(inst)
+                local c = modelConns[inst]
+                if c then c:Disconnect() modelConns[inst] = nil end
+                if State.current == inst then cancelTween() end
+            end
+        end)
+    end
+end
+
+local function detachFolder()
+    for _, c in ipairs(scanConns) do c:Disconnect() end
+    table.clear(scanConns)
+    for _, c in pairs(modelConns) do c:Disconnect() end
+    table.clear(modelConns)
+    table.clear(pending)
+    pendingCount = 0
+    scanFolder = nil
+end
+
+local function syncFolder()
+    local wi = Workspace:FindFirstChild("WorldIgnore")
+    local folder = wi and wi:FindFirstChild("Pickups")
+    if folder == scanFolder then return end
+    detachFolder()
+    if not folder then return end
+
+    scanFolder = folder
+    scanConns[1] = folder.DescendantAdded:Connect(function(d)
+        pcall(registerModel, d)
+    end)
+    for _, d in ipairs(folder:GetDescendants()) do
+        pcall(registerModel, d)
+    end
+end
+
+local function startScanner()
+    scanToken += 1
+    local myToken = scanToken
+    task.spawn(function()
+        while myToken == scanToken and not State.destroyed do
+            local ok, err = pcall(syncFolder)
+            if not ok then warn("[ShopTween] scan error: " .. tostring(err)) end
+            task.wait(CONFIG.ScanInterval)
+        end
+    end)
+end
+
+local function stopScanner()
+    scanToken += 1
+    detachFolder()
+end
+
+-- // Start / stop
+-- The ONLY place automation loops are started. Bumping the token retires any older loop,
+-- so two loops can never both be "alive". Does nothing while respawning.
+local function launchLoop()
+    if State.destroyed or not State.enabled or State.paused then return end
+    State.token += 1
+    task.spawn(mainLoop, State.token)
+end
+
+local function startAll()
+    if State.enabled or State.destroyed then return end
+    State.enabled = true
+    startScanner()
+    launchLoop() -- no-op while respawning; finishRespawn() launches it afterwards
+end
+
+local function stopAll()
+    State.token += 1
+    State.enabled = false
+    cancelTween()
+    stopScanner()
+    if State.current then visited[State.current] = nil end
+    rescue()
+    endMovement()
+    State.current, State.phase = nil, nil
+    State.manualOnce = false
+end
+
+-- // Respawn handling
+-- Flow:  Died / CharacterRemoving -> beginRespawn()  (instant hard stop, State.paused = true)
+--        waiter polls until a NEW living character is genuinely ready (+ stable)
+--        then waits PostSpawnDelay more seconds
+--        finishRespawn() -> State.paused = false and the loop is relaunched if still ON
+local function characterReady(char)
+    if not char or respawn.dead[char] then return false end
+    if LocalPlayer.Character ~= char then return false end
+    if not char:IsDescendantOf(Workspace) then return false end
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    if not hum or not hrp or not hrp:IsA("BasePart") then return false end
+    if hum.Health <= 0 or hum:GetState() == Enum.HumanoidStateType.Dead then return false end
+    if CONFIG.RequireUnanchored and hrp.Anchored then return false end
+    return true, hrp
+end
+
+-- Waits until a new character has looked ready continuously for ReadyStableTime.
+local function awaitReady(valid)
+    local lastChar, lastPos, stableSince
+    while valid() do
+        local char = LocalPlayer.Character
+        local ok, hrp = characterReady(char)
+        if ok then
+            local now = os.clock()
+            if char ~= lastChar then
+                lastChar, lastPos, stableSince = char, hrp.Position, now
+            else
+                local p = hrp.Position
+                if (p - lastPos).Magnitude > CONFIG.ReadyMoveTolerance then
+                    stableSince = now -- got teleported (e.g. out of the respawn box): start over
+                end
+                lastPos = p
+            end
+            if now - stableSince >= CONFIG.ReadyStableTime then
+                return char
+            end
+        else
+            lastChar, lastPos, stableSince = nil, nil, nil
+        end
+        State.respawnText = "Respawning - waiting for spawn"
+        task.wait(CONFIG.ReadyPollInterval)
+    end
+    return nil
+end
+
+local function finishRespawn()
+    respawn.waiting = false
+    State.paused = false
+    State.respawnText = nil
+    if State.enabled then
+        launchLoop() -- resumes automatically; no OFF/ON toggle needed
+    end
+end
+
+local function runRespawnWait(session)
+    local function valid()
+        return respawn.session == session and not State.destroyed
+    end
+
+    while valid() do
+        local char = awaitReady(valid)
+        if not char then return end
+
+        -- Character is genuinely ready: now wait the extra delay, re-checking it the whole time
+        local t0 = os.clock()
+        local lost = false
+        while valid() do
+            local remaining = CONFIG.PostSpawnDelay - (os.clock() - t0)
+            if remaining <= 0 then break end
+            if LocalPlayer.Character ~= char or not characterReady(char) then
+                lost = true -- died / replaced during the delay: start the whole wait over
+                break
+            end
+            State.respawnText = string.format("Spawned - resuming in %.1fs", remaining)
+            task.wait(CONFIG.ReadyPollInterval)
+        end
+        if not valid() then return end
+
+        if not lost and LocalPlayer.Character == char and characterReady(char) then
+            finishRespawn()
+            return
+        end
+    end
+end
+
+-- Instantly gates ALL automation. Safe to call repeatedly (Died + CharacterRemoving both call it):
+-- only one waiter ever exists.
+local function beginRespawn()
+    if State.destroyed then return end
+    State.paused = true
+    State.token += 1            -- retires the running loop and every tween wait
+    State.manualOnce = false
+
+    -- Cancel the active target and put it back in the queue so it isn't lost
+    local cur = State.current
+    State.current, State.phase = nil, nil
+    if cur and isValid(cur) then
+        visited[cur] = nil
+        addPending(cur)
+    end
+
+    resetMovementState()        -- cancels tween, disconnects movement hook, clears underground state
+    State.respawnText = "Respawning - waiting for spawn"
+
+    if not respawn.waiting then
+        respawn.waiting = true
+        respawn.session += 1
+        task.spawn(runRespawnWait, respawn.session)
+    end
+end
+
+local function handleDeath(char)
+    if char then respawn.dead[char] = true end
+    beginRespawn()
+end
+
+-- Always re-binds to the current character's Humanoid (one Died connection at a time)
+local function bindCharacter(char)
+    respawn.bindId += 1
+    local id = respawn.bindId
+    if respawn.diedConn then
+        respawn.diedConn:Disconnect()
+        respawn.diedConn = nil
+    end
+    if not char then return end
+
+    task.spawn(function()
+        local hum = char:FindFirstChildOfClass("Humanoid") or char:WaitForChild("Humanoid", 10)
+        if not hum or State.destroyed or id ~= respawn.bindId or LocalPlayer.Character ~= char then return end
+        respawn.diedConn = hum.Died:Connect(function()
+            handleDeath(char)
+        end)
+        if hum.Health <= 0 then handleDeath(char) end
+    end)
+end
+
+table.insert(coreConns, LocalPlayer.CharacterRemoving:Connect(function(char)
+    handleDeath(char)
+end))
+table.insert(coreConns, LocalPlayer.CharacterAdded:Connect(function(char)
+    bindCharacter(char)
+    -- Normally already gated by Died/CharacterRemoving; this covers a character appearing without either.
+    if not respawn.waiting then beginRespawn() end
+end))
+bindCharacter(LocalPlayer.Character)
+
+-- =====================================================================
+-- // Player features (independent of the tween automation)
+-- =====================================================================
+
+-- // ShopModel ESP: its own scanner, only runs while the ESP toggle is ON
+local ESP = { holder = nil, items = {}, folder = nil, folderConn = nil, token = 0, running = false }
+
+function ESP.remove(model)
+    local it = ESP.items[model]
+    if not it then return end
+    ESP.items[model] = nil
+    pcall(function() it.conn:Disconnect() end)
+    pcall(function() it.hl:Destroy() end)
+end
+
+function ESP.add(inst)
+    if State.destroyed or not ESP.holder then return end
+    if inst.Name ~= CONFIG.TargetName then return end
+    if not (inst:IsA("Model") or inst:IsA("BasePart")) then return end
+    if ESP.items[inst] then return end
+
+    local hl = Instance.new("Highlight")
+    hl.Name = "ShopESP"
+    hl.Adornee = inst
+    hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop -- visible through walls
+    hl.FillColor = CONFIG.ESPFill
+    hl.FillTransparency = CONFIG.ESPFillAlpha
+    hl.OutlineColor = CONFIG.ESPOutline
+    hl.OutlineTransparency = 0
+    hl.Parent = ESP.holder
+
+    local conn = inst.AncestryChanged:Connect(function()
+        if not inst:IsDescendantOf(Workspace) then ESP.remove(inst) end
+    end)
+    ESP.items[inst] = { hl = hl, conn = conn }
+end
+
+function ESP.detach()
+    if ESP.folderConn then
+        pcall(function() ESP.folderConn:Disconnect() end)
+        ESP.folderConn = nil
+    end
+    for model in pairs(ESP.items) do ESP.remove(model) end
+    ESP.folder = nil
+end
+
+function ESP.sync()
+    local wi = Workspace:FindFirstChild("WorldIgnore")
+    local folder = wi and wi:FindFirstChild("Pickups")
+    if folder == ESP.folder then return end
+    ESP.detach()
+    if not folder then return end
+
+    ESP.folder = folder
+    ESP.folderConn = folder.DescendantAdded:Connect(function(d)
+        pcall(ESP.add, d)
+    end)
+    for _, d in ipairs(folder:GetDescendants()) do
+        pcall(ESP.add, d)
+    end
+end
+
+function ESP.start()
+    if ESP.running or State.destroyed then return end
+    ESP.running = true
+    ESP.token += 1
+    local myToken = ESP.token
+    task.spawn(function()
+        while ESP.running and ESP.token == myToken and not State.destroyed do
+            local ok, err = pcall(ESP.sync)
+            if not ok then warn("[ShopTween] ESP error: " .. tostring(err)) end
+            task.wait(CONFIG.ScanInterval)
+        end
+    end)
+end
+
+function ESP.stop()
+    ESP.running = false
+    ESP.token += 1
+    ESP.detach()
+end
+
+-- // WalkSpeed / JumpPower / Infinite Jump
+-- Values are only enforced once you have moved the slider (nil = leave the game's own value alone).
+local Player = { conns = {}, bindId = 0, jumpConn = nil }
+
+function Player.humanoid()
+    local char = LocalPlayer.Character
+    return char and char:FindFirstChildOfClass("Humanoid")
+end
+
+function Player.readWalk()
+    local hum = Player.humanoid()
+    return hum and hum.WalkSpeed or CONFIG.DefaultWalkSpeed
+end
+
+-- Slider unit is "JumpPower". Games using JumpHeight get the equivalent height: h = v^2 / (2g)
+function Player.readJump()
+    local hum = Player.humanoid()
+    if not hum then return CONFIG.DefaultJumpPower end
+    if hum.UseJumpPower then return hum.JumpPower end
+    return math.sqrt(2 * Workspace.Gravity * hum.JumpHeight)
+end
+
+function Player.apply(hum)
+    hum = hum or Player.humanoid()
+    if not hum then return end
+    if State.walkSpeed and hum.WalkSpeed ~= State.walkSpeed then
+        hum.WalkSpeed = State.walkSpeed
+    end
+    if State.jumpPower then
+        if hum.UseJumpPower then
+            if hum.JumpPower ~= State.jumpPower then hum.JumpPower = State.jumpPower end
+        else
+            local h = State.jumpPower ^ 2 / (2 * Workspace.Gravity)
+            if math.abs(hum.JumpHeight - h) > 0.001 then hum.JumpHeight = h end
+        end
+    end
+end
+
+function Player.clearConns()
+    for _, c in ipairs(Player.conns) do pcall(function() c:Disconnect() end) end
+    table.clear(Player.conns)
+end
+
+-- Own CharacterAdded binding (does not touch the respawn system). One set of listeners at a time:
+-- re-applies on spawn and whenever the game changes the values back.
+function Player.bind(char)
+    Player.bindId += 1
+    local id = Player.bindId
+    Player.clearConns()
+    if not char then return end
+
+    task.spawn(function()
+        local hum = char:FindFirstChildOfClass("Humanoid") or char:WaitForChild("Humanoid", 10)
+        if not hum or State.destroyed or id ~= Player.bindId or LocalPlayer.Character ~= char then return end
+        local function reapply() pcall(Player.apply, hum) end
+        for _, prop in ipairs({ "WalkSpeed", "JumpPower", "JumpHeight", "UseJumpPower" }) do
+            table.insert(Player.conns, hum:GetPropertyChangedSignal(prop):Connect(reapply))
+        end
+        reapply()
+    end)
+end
+
+function Player.onJumpRequest()
+    if not State.infJump or State.destroyed then return end
+    if move.conn then return end -- the tween controller owns the character: never interfere
+    local hum = Player.humanoid()
+    if not hum or hum.Health <= 0 then return end
+    pcall(function() hum:ChangeState(Enum.HumanoidStateType.Jumping) end)
+end
+
+function Player.jumpOff()
+    if Player.jumpConn then
+        pcall(function() Player.jumpConn:Disconnect() end)
+        Player.jumpConn = nil
+    end
+end
+
+function Player.setInfJump(on)
+    State.infJump = on
+    saveSettings()
+    if on then
+        if not Player.jumpConn then -- never more than one connection
+            Player.jumpConn = UserInputService.JumpRequest:Connect(Player.onJumpRequest)
+        end
+    else
+        Player.jumpOff()
+    end
+end
+
+table.insert(coreConns, LocalPlayer.CharacterAdded:Connect(Player.bind))
+Player.bind(LocalPlayer.Character)
+
+-- =====================================================================
+-- // UI
+-- =====================================================================
+local THEME = {
+    bg        = Color3.fromRGB(15, 16, 20),
+    card      = Color3.fromRGB(24, 25, 31),
+    cardHover = Color3.fromRGB(31, 33, 41),
+    stroke    = Color3.fromRGB(44, 46, 58),
+    text      = Color3.fromRGB(236, 238, 244),
+    muted     = Color3.fromRGB(128, 133, 148),
+    accent    = Color3.fromRGB(124, 108, 255),
+    on        = Color3.fromRGB(52, 211, 153),
+    off       = Color3.fromRGB(62, 65, 80),
+    danger    = Color3.fromRGB(244, 95, 95),
+    white     = Color3.fromRGB(255, 255, 255),
+}
+
+-- Window sizing: the window grows/shrinks to fit the active tab
+local WIN_W, TITLE_H, TABS_H = 300, 40, 36
+local PAGE_H = { Main = 444, Player = 246 }
+local activeTab = "Main"
+local minimized = false
+local function winHeight()
+    return TITLE_H + 1 + TABS_H + PAGE_H[activeTab]
+end
+
+local function mk(class, props, parent)
+    local inst = Instance.new(class)
+    for k, v in pairs(props) do inst[k] = v end
+    if parent then inst.Parent = parent end
+    return inst
+end
+
+local function corner(inst, r)
+    return mk("UICorner", { CornerRadius = UDim.new(0, r) }, inst)
+end
+
+local function outline(inst, color, thickness, transparency)
+    return mk("UIStroke", {
+        Color = color or THEME.stroke,
+        Thickness = thickness or 1,
+        Transparency = transparency or 0,
+        ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+    }, inst)
+end
+
+local function tw(inst, dur, props, style, dir)
+    local t = TweenService:Create(inst, TweenInfo.new(dur, style or Enum.EasingStyle.Quad, dir or Enum.EasingDirection.Out), props)
+    t:Play()
+    return t
+end
+
+local function rgbStr(c)
+    return string.format("rgb(%d,%d,%d)",
+        math.floor(c.R * 255 + 0.5), math.floor(c.G * 255 + 0.5), math.floor(c.B * 255 + 0.5))
+end
+
+local uiConns = {}
+
+local gui = mk("ScreenGui", {
+    Name = "ShopTween_" .. tostring(math.random(100000, 999999)),
+    ResetOnSpawn = false,
+    ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+    IgnoreGuiInset = true,
+    DisplayOrder = 999,
+})
+pcall(function()
+    if syn and syn.protect_gui then syn.protect_gui(gui) end
+end)
+do
+    local ok = pcall(function()
+        gui.Parent = (gethui and gethui()) or CoreGui
+    end)
+    if not ok or not gui.Parent then
+        gui.Parent = LocalPlayer:WaitForChild("PlayerGui")
+    end
+end
+
+-- Holder for ESP highlights (same protected parent as the GUI)
+ESP.holder = mk("Folder", { Name = "ShopESP_" .. tostring(math.random(100000, 999999)) })
+ESP.holder.Parent = gui.Parent or gui
+
+local main = mk("Frame", {
+    Name = "Main",
+    Size = UDim2.fromOffset(WIN_W, winHeight()),
+    Position = UDim2.new(0.5, -WIN_W / 2, 0.5, -winHeight() / 2),
+    BackgroundColor3 = THEME.bg,
+    BorderSizePixel = 0,
+    ClipsDescendants = true,
+}, gui)
+corner(main, 12)
+outline(main, THEME.stroke, 1)
+
+local winScale = mk("UIScale", { Scale = 0.9 }, main)
+tw(winScale, 0.35, { Scale = 1 }, Enum.EasingStyle.Back)
+
+-- Title bar
+local titleBar = mk("Frame", {
+    Name = "TitleBar",
+    Size = UDim2.new(1, 0, 0, TITLE_H),
+    BackgroundTransparency = 1,
+}, main)
+
+local accentDot = mk("Frame", {
+    Size = UDim2.fromOffset(8, 8),
+    Position = UDim2.new(0, 14, 0.5, -4),
+    BackgroundColor3 = THEME.accent,
+    BorderSizePixel = 0,
+}, titleBar)
+corner(accentDot, 4)
+
+mk("TextLabel", {
+    Text = "Shop Tween",
+    Font = Enum.Font.GothamBold,
+    TextSize = 14,
+    TextColor3 = THEME.text,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    BackgroundTransparency = 1,
+    Position = UDim2.fromOffset(30, 0),
+    Size = UDim2.new(1, -110, 1, 0),
+}, titleBar)
+
+mk("Frame", {
+    Position = UDim2.new(0, 0, 1, -1),
+    Size = UDim2.new(1, 0, 0, 1),
+    BackgroundColor3 = THEME.stroke,
+    BorderSizePixel = 0,
+}, titleBar)
+
+local function iconButton(text, offsetX, hoverColor)
+    local b = mk("TextButton", {
+        Text = text,
+        Font = Enum.Font.GothamBold,
+        TextSize = 16,
+        TextColor3 = THEME.muted,
+        AutoButtonColor = false,
+        BackgroundColor3 = hoverColor,
+        BackgroundTransparency = 1,
+        Size = UDim2.fromOffset(26, 26),
+        Position = UDim2.new(1, offsetX, 0.5, -13),
+    }, titleBar)
+    corner(b, 6)
+    b.MouseEnter:Connect(function()
+        tw(b, 0.15, { BackgroundTransparency = 0.1, TextColor3 = THEME.white })
+    end)
+    b.MouseLeave:Connect(function()
+        tw(b, 0.15, { BackgroundTransparency = 1, TextColor3 = THEME.muted })
+    end)
+    return b
+end
+
+local minBtn   = iconButton("–", -66, THEME.stroke)
+local closeBtn = iconButton("×", -36, THEME.danger)
+
+-- Content (tab bar + one page per tab). Fixed height = tallest page, the window clips the rest.
+local content = mk("Frame", {
+    Name = "Content",
+    Position = UDim2.fromOffset(0, TITLE_H + 1),
+    Size = UDim2.new(1, 0, 0, TABS_H + PAGE_H.Main),
+    BackgroundTransparency = 1,
+}, main)
+
+local tabBar = mk("Frame", {
+    Name = "Tabs",
+    Size = UDim2.new(1, 0, 0, TABS_H),
+    BackgroundTransparency = 1,
+}, content)
+mk("UIPadding", {
+    PaddingLeft = UDim.new(0, 12), PaddingRight = UDim.new(0, 12),
+    PaddingTop = UDim.new(0, 8),
+}, tabBar)
+mk("UIListLayout", {
+    FillDirection = Enum.FillDirection.Horizontal,
+    Padding = UDim.new(0, 6),
+    SortOrder = Enum.SortOrder.LayoutOrder,
+}, tabBar)
+
+local function newPage(name, visible)
+    local p = mk("Frame", {
+        Name = name,
+        Position = UDim2.fromOffset(0, TABS_H),
+        Size = UDim2.new(1, 0, 1, -TABS_H),
+        BackgroundTransparency = 1,
+        Visible = visible,
+    }, content)
+    mk("UIPadding", {
+        PaddingLeft = UDim.new(0, 12), PaddingRight = UDim.new(0, 12),
+        PaddingTop = UDim.new(0, 10), PaddingBottom = UDim.new(0, 12),
+    }, p)
+    mk("UIListLayout", {
+        Padding = UDim.new(0, 8),
+        SortOrder = Enum.SortOrder.LayoutOrder,
+    }, p)
+    return p
+end
+
+local mainPage   = newPage("MainPage", true)
+local playerPage = newPage("PlayerPage", false)
+local cardParent = mainPage
+
+do -- tabs
+    local tabs = {}
+    local pages = { Main = mainPage, Player = playerPage }
+
+    local function paintTab(t)
+        local active = activeTab == t.name
+        local bg  = active and THEME.accent or (t.hover and THEME.cardHover or THEME.card)
+        local txt = active and THEME.white or (t.hover and THEME.text or THEME.muted)
+        tw(t.btn, 0.15, { BackgroundColor3 = bg, TextColor3 = txt })
+        tw(t.stroke, 0.15, { Color = active and THEME.accent or THEME.stroke })
+    end
+
+    local function setTab(name)
+        if activeTab == name then return end
+        activeTab = name
+        for pname, page in pairs(pages) do page.Visible = (pname == name) end
+        for _, t in ipairs(tabs) do paintTab(t) end
+        if not minimized then
+            tw(main, 0.28, { Size = UDim2.fromOffset(WIN_W, winHeight()) }, Enum.EasingStyle.Quint)
+        end
+    end
+
+    for i, name in ipairs({ "Main", "Player" }) do
+        local isActive = name == activeTab
+        local b = mk("TextButton", {
+            Text = name,
+            Font = Enum.Font.GothamMedium,
+            TextSize = 12,
+            TextColor3 = isActive and THEME.white or THEME.muted,
+            AutoButtonColor = false,
+            BackgroundColor3 = isActive and THEME.accent or THEME.card,
+            BorderSizePixel = 0,
+            Size = UDim2.new(0.5, -3, 1, 0),
+            LayoutOrder = i,
+        }, tabBar)
+        corner(b, 8)
+        local s = outline(b, isActive and THEME.accent or THEME.stroke, 1)
+        local sc = mk("UIScale", {}, b)
+        local t = { name = name, btn = b, stroke = s, hover = false }
+        tabs[i] = t
+
+        b.MouseEnter:Connect(function() t.hover = true paintTab(t) end)
+        b.MouseLeave:Connect(function()
+            t.hover = false
+            tw(sc, 0.1, { Scale = 1 })
+            paintTab(t)
+        end)
+        b.MouseButton1Down:Connect(function() tw(sc, 0.08, { Scale = 0.96 }) end)
+        b.MouseButton1Up:Connect(function() tw(sc, 0.12, { Scale = 1 }, Enum.EasingStyle.Back) end)
+        b.MouseButton1Click:Connect(function() setTab(name) end)
+    end
+end
+
+local function card(height, order)
+    local f = mk("Frame", {
+        Size = UDim2.new(1, 0, 0, height),
+        BackgroundColor3 = THEME.card,
+        BorderSizePixel = 0,
+        LayoutOrder = order,
+    }, cardParent)
+    corner(f, 8)
+    local s = outline(f, THEME.stroke, 1)
+    local scale = mk("UIScale", {}, f)
+    return f, s, scale
+end
+
+local function attachFx(btn, frame, scale)
+    btn.MouseEnter:Connect(function()
+        tw(frame, 0.15, { BackgroundColor3 = THEME.cardHover })
+    end)
+    btn.MouseLeave:Connect(function()
+        tw(frame, 0.15, { BackgroundColor3 = THEME.card })
+        tw(scale, 0.1, { Scale = 1 })
+    end)
+    btn.MouseButton1Down:Connect(function()
+        tw(scale, 0.08, { Scale = 0.97 })
+    end)
+    btn.MouseButton1Up:Connect(function()
+        tw(scale, 0.12, { Scale = 1 }, Enum.EasingStyle.Back)
+    end)
+end
+
+local function overlay(parent)
+    return mk("TextButton", {
+        Text = "",
+        AutoButtonColor = false,
+        BackgroundTransparency = 1,
+        Size = UDim2.fromScale(1, 1),
+        ZIndex = 5,
+    }, parent)
+end
+
+local function makeSwitch(parent)
+    local track = mk("Frame", {
+        Size = UDim2.fromOffset(38, 20),
+        Position = UDim2.new(1, -50, 0.5, -10),
+        BackgroundColor3 = THEME.off,
+        BorderSizePixel = 0,
+    }, parent)
+    corner(track, 10)
+    local knob = mk("Frame", {
+        Size = UDim2.fromOffset(14, 14),
+        Position = UDim2.fromOffset(3, 3),
+        BackgroundColor3 = THEME.white,
+        BorderSizePixel = 0,
+    }, track)
+    corner(knob, 7)
+
+    return function(on, instant)
+        local trackColor = on and THEME.on or THEME.off
+        local knobPos = on and UDim2.fromOffset(21, 3) or UDim2.fromOffset(3, 3)
+        if instant then
+            track.BackgroundColor3 = trackColor
+            knob.Position = knobPos
+        else
+            tw(track, 0.2, { BackgroundColor3 = trackColor })
+            tw(knob, 0.2, { Position = knobPos }, Enum.EasingStyle.Back)
+        end
+    end
+end
+
+-- Reusable slider card. Updates the value live while dragging.
+local function makeSlider(order, label, minV, maxV, step, initial, fmt, onChanged)
+    local f = card(58, order)
+
+    local nameLbl = mk("TextLabel", {
+        Text = label,
+        Font = Enum.Font.GothamMedium,
+        TextSize = 13,
+        TextColor3 = THEME.text,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        BackgroundTransparency = 1,
+        Position = UDim2.fromOffset(14, 8),
+        Size = UDim2.new(0.5, 0, 0, 18),
+    }, f)
+    local valueLbl = mk("TextLabel", {
+        Text = "",
+        Font = Enum.Font.GothamMedium,
+        TextSize = 12,
+        TextColor3 = THEME.accent,
+        TextXAlignment = Enum.TextXAlignment.Right,
+        BackgroundTransparency = 1,
+        Position = UDim2.new(0.5, 0, 0, 8),
+        Size = UDim2.new(0.5, -14, 0, 18),
+    }, f)
+
+    local track = mk("Frame", {
+        Position = UDim2.new(0, 14, 0, 40),
+        Size = UDim2.new(1, -28, 0, 6),
+        BackgroundColor3 = THEME.off,
+        BorderSizePixel = 0,
+    }, f)
+    corner(track, 3)
+    local fill = mk("Frame", {
+        Size = UDim2.fromScale(0, 1),
+        BackgroundColor3 = THEME.accent,
+        BorderSizePixel = 0,
+    }, track)
+    corner(fill, 3)
+    local knob = mk("Frame", {
+        AnchorPoint = Vector2.new(0.5, 0.5),
+        Size = UDim2.fromOffset(14, 14),
+        Position = UDim2.new(0, 0, 0.5, 0),
+        BackgroundColor3 = THEME.white,
+        BorderSizePixel = 0,
+        ZIndex = 2,
+    }, track)
+    corner(knob, 7)
+    local knobStroke = outline(knob, THEME.accent, 2)
+
+    local value
+    local function render(v)
+        local a = (v - minV) / (maxV - minV)
+        fill.Size = UDim2.fromScale(a, 1)
+        knob.Position = UDim2.new(a, 0, 0.5, 0)
+        valueLbl.Text = fmt(v)
+    end
+    local function setValue(v)
+        v = snapValue(v, minV, maxV, step)
+        if v == value then return end
+        value = v
+        render(v)
+        onChanged(v)
+    end
+    value = snapValue(initial, minV, maxV, step)
+    render(value)
+
+    local hit = mk("TextButton", {
+        Text = "",
+        AutoButtonColor = false,
+        BackgroundTransparency = 1,
+        Position = UDim2.new(0, 0, 0, 26),
+        Size = UDim2.new(1, 0, 1, -26),
+        ZIndex = 5,
+    }, f)
+
+    local dragging = false
+    local function fromX(x)
+        local w = track.AbsoluteSize.X
+        if w <= 0 then return end
+        local rel = math.clamp((x - track.AbsolutePosition.X) / w, 0, 1)
+        setValue(minV + rel * (maxV - minV))
+    end
+
+    hit.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            tw(knob, 0.12, { Size = UDim2.fromOffset(18, 18) }, Enum.EasingStyle.Back)
+            fromX(input.Position.X)
+        end
+    end)
+    table.insert(uiConns, UserInputService.InputChanged:Connect(function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+            or input.UserInputType == Enum.UserInputType.Touch) then
+            fromX(input.Position.X)
+        end
+    end))
+    table.insert(uiConns, UserInputService.InputEnded:Connect(function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch) then
+            dragging = false
+            tw(knob, 0.12, { Size = UDim2.fromOffset(14, 14) })
+        end
+    end))
+
+    -- Visual "inactive" state (slider still works, it just has no effect)
+    local function setEnabled(on)
+        local accent = on and THEME.accent or THEME.muted
+        tw(fill, 0.2, { BackgroundColor3 = accent })
+        tw(valueLbl, 0.2, { TextColor3 = accent })
+        tw(nameLbl, 0.2, { TextColor3 = on and THEME.text or THEME.muted })
+        tw(knobStroke, 0.2, { Color = accent })
+    end
+
+    return { frame = f, setEnabled = setEnabled }
+end
+
+-- 1) Main toggle -------------------------------------------------------
+local mainCard, mainStroke, mainScale = card(46, 1)
+local mainDot = mk("Frame", {
+    Size = UDim2.fromOffset(10, 10),
+    Position = UDim2.new(0, 14, 0.5, -5),
+    BackgroundColor3 = THEME.danger,
+    BorderSizePixel = 0,
+}, mainCard)
+corner(mainDot, 5)
+local mainLabel = mk("TextLabel", {
+    RichText = true,
+    Text = "",
+    Font = Enum.Font.GothamBold,
+    TextSize = 14,
+    TextColor3 = THEME.text,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    BackgroundTransparency = 1,
+    Position = UDim2.fromOffset(34, 0),
+    Size = UDim2.new(1, -100, 1, 0),
+}, mainCard)
+local setMainSwitch = makeSwitch(mainCard)
+
+local function renderMain(on, instant)
+    mainLabel.Text = 'Tweening: <font color="' .. rgbStr(on and THEME.on or THEME.muted) .. '">'
+        .. (on and "ON" or "OFF") .. "</font>"
+    local dotColor = on and THEME.on or THEME.danger
+    local strokeColor = on and THEME.on or THEME.stroke
+    if instant then
+        mainDot.BackgroundColor3 = dotColor
+        mainStroke.Color = strokeColor
+    else
+        tw(mainDot, 0.2, { BackgroundColor3 = dotColor })
+        tw(mainStroke, 0.2, { Color = strokeColor })
+    end
+    setMainSwitch(on, instant)
+end
+
+local function setTweening(v)
+    if v then startAll() else stopAll() end
+    renderMain(State.enabled)
+end
+
+local mainBtn = overlay(mainCard)
+attachFx(mainBtn, mainCard, mainScale)
+mainBtn.MouseButton1Click:Connect(function()
+    setTweening(not State.enabled)
+end)
+renderMain(false, true)
+
+-- 2) Tween speed slider -------------------------------------------------
+makeSlider(2, "Tween Speed", CONFIG.MinSpeed, CONFIG.MaxSpeed, CONFIG.SpeedStep, State.speed,
+    function(v) return tostring(v) .. " studs/s" end,
+    function(v)
+        State.speed = v
+        saveSettings()
+    end)
+
+-- 3) Underground depth slider -------------------------------------------
+local depthSlider = makeSlider(3, "Underground Depth", CONFIG.MinDepth, CONFIG.MaxDepth, CONFIG.DepthStep, State.depth,
+    function(v) return string.format("%.1f studs", v) end,
+    function(v)
+        State.depth = v
+        State.depthVersion += 1 -- running tweens re-aim at the new height immediately
+        saveSettings()
+    end)
+depthSlider.setEnabled(State.underMap)
+
+-- 4/5) Toggle rows ------------------------------------------------------
+-- showState = true renders "Label: ON/OFF" with a colored state next to the switch
+local function makeToggleRow(order, label, desc, initial, onChanged, showState)
+    local f, _, scale = card(42, order)
+    local nameLbl = mk("TextLabel", {
+        RichText = showState == true,
+        Text = label,
+        Font = Enum.Font.GothamMedium,
+        TextSize = 13,
+        TextColor3 = THEME.text,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        BackgroundTransparency = 1,
+        Position = UDim2.fromOffset(14, 5),
+        Size = UDim2.new(1, -80, 0, 18),
+    }, f)
+    mk("TextLabel", {
+        Text = desc,
+        Font = Enum.Font.Gotham,
+        TextSize = 11,
+        TextColor3 = THEME.muted,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        BackgroundTransparency = 1,
+        Position = UDim2.fromOffset(14, 22),
+        Size = UDim2.new(1, -80, 0, 14),
+    }, f)
+
+    local function renderName(v)
+        if not showState then return end
+        nameLbl.Text = label .. ': <font color="' .. rgbStr(v and THEME.on or THEME.muted) .. '">'
+            .. (v and "ON" or "OFF") .. "</font>"
+    end
+
+    local setVisual = makeSwitch(f)
+    local value = initial
+    setVisual(value, true)
+    renderName(value)
+
+    local btn = overlay(f)
+    attachFx(btn, f, scale)
+    btn.MouseButton1Click:Connect(function()
+        value = not value
+        setVisual(value)
+        renderName(value)
+        onChanged(value)
+    end)
+end
+
+makeToggleRow(4, "Under Map Mode", "Travel just beneath the surface", State.underMap, function(v)
+    State.underMap = v
+    saveSettings()
+    depthSlider.setEnabled(v)
+end)
+makeToggleRow(5, "Auto Target", "Automatically go to new ShopModels", State.autoTarget, function(v)
+    State.autoTarget = v
+    saveSettings()
+end)
+
+-- 6) Manual target button -----------------------------------------------
+local btnCard, btnStroke, btnScale = card(36, 6)
+btnStroke.Color = THEME.accent
+btnStroke.Transparency = 0.55
+mk("TextLabel", {
+    Text = "Target Nearest ShopModel",
+    Font = Enum.Font.GothamMedium,
+    TextSize = 13,
+    TextColor3 = THEME.accent,
+    BackgroundTransparency = 1,
+    Size = UDim2.fromScale(1, 1),
+}, btnCard)
+local nearestBtn = overlay(btnCard)
+attachFx(nearestBtn, btnCard, btnScale)
+nearestBtn.MouseButton1Click:Connect(function()
+    if not State.enabled then
+        notify("Turn Tweening ON first")
+        return
+    end
+    if State.paused then
+        notify("Respawning - please wait")
+        return
+    end
+    State.manualOnce = true
+end)
+
+-- 7) Crates Collected counter + Reset ------------------------------------
+do
+    local counterCard, counterStroke = card(40, 7)
+    local counterLabel = mk("TextLabel", {
+        RichText = true,
+        Text = "",
+        Font = Enum.Font.GothamMedium,
+        TextSize = 13,
+        TextColor3 = THEME.text,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        BackgroundTransparency = 1,
+        Position = UDim2.fromOffset(14, 0),
+        Size = UDim2.new(1, -90, 1, 0),
+    }, counterCard)
+
+    local function renderCounter()
+        counterLabel.Text = 'Crates Collected: <font color="' .. rgbStr(THEME.accent) .. '">'
+            .. tostring(State.collected) .. "</font>"
+    end
+    renderCounter()
+
+    -- Called by the collector the moment a crate is confirmed collected (live update + brief flash)
+    Collect.onChange = function(flash)
+        renderCounter()
+        if flash then
+            tw(counterStroke, 0.12, { Color = THEME.on })
+            task.delay(0.4, function()
+                pcall(function() tw(counterStroke, 0.25, { Color = THEME.stroke }) end)
+            end)
+        end
+    end
+
+    local resetBtn = mk("TextButton", {
+        Text = "Reset",
+        Font = Enum.Font.GothamMedium,
+        TextSize = 11,
+        TextColor3 = THEME.muted,
+        AutoButtonColor = false,
+        BackgroundColor3 = THEME.bg,
+        BorderSizePixel = 0,
+        Size = UDim2.fromOffset(56, 24),
+        Position = UDim2.new(1, -68, 0.5, -12),
+        ZIndex = 5,
+    }, counterCard)
+    corner(resetBtn, 6)
+    local resetStroke = outline(resetBtn, THEME.stroke, 1)
+    local resetScale = mk("UIScale", {}, resetBtn)
+
+    resetBtn.MouseEnter:Connect(function()
+        tw(resetBtn, 0.15, { BackgroundColor3 = THEME.cardHover, TextColor3 = THEME.danger })
+        tw(resetStroke, 0.15, { Color = THEME.danger })
+    end)
+    resetBtn.MouseLeave:Connect(function()
+        tw(resetBtn, 0.15, { BackgroundColor3 = THEME.bg, TextColor3 = THEME.muted })
+        tw(resetStroke, 0.15, { Color = THEME.stroke })
+        tw(resetScale, 0.1, { Scale = 1 })
+    end)
+    resetBtn.MouseButton1Down:Connect(function() tw(resetScale, 0.08, { Scale = 0.93 }) end)
+    resetBtn.MouseButton1Up:Connect(function() tw(resetScale, 0.12, { Scale = 1 }, Enum.EasingStyle.Back) end)
+    resetBtn.MouseButton1Click:Connect(function()
+        State.collected = 0
+        saveSettings()
+        renderCounter()
+    end)
+end
+
+-- 8) Status card --------------------------------------------------------
+local statusCard = card(44, 8)
+mk("TextLabel", {
+    Text = "STATUS",
+    Font = Enum.Font.GothamBold,
+    TextSize = 10,
+    TextColor3 = THEME.muted,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    BackgroundTransparency = 1,
+    Position = UDim2.fromOffset(14, 6),
+    Size = UDim2.new(1, -90, 0, 12),
+}, statusCard)
+local statusText = mk("TextLabel", {
+    Text = "Disabled",
+    Font = Enum.Font.GothamMedium,
+    TextSize = 12,
+    TextColor3 = THEME.text,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    TextTruncate = Enum.TextTruncate.AtEnd,
+    BackgroundTransparency = 1,
+    Position = UDim2.fromOffset(14, 20),
+    Size = UDim2.new(1, -90, 0, 18),
+}, statusCard)
+mk("TextLabel", {
+    Text = "QUEUE",
+    Font = Enum.Font.GothamBold,
+    TextSize = 10,
+    TextColor3 = THEME.muted,
+    TextXAlignment = Enum.TextXAlignment.Right,
+    BackgroundTransparency = 1,
+    Position = UDim2.new(1, -74, 0, 6),
+    Size = UDim2.fromOffset(60, 12),
+}, statusCard)
+local queueText = mk("TextLabel", {
+    Text = "0",
+    Font = Enum.Font.GothamBold,
+    TextSize = 14,
+    TextColor3 = THEME.accent,
+    TextXAlignment = Enum.TextXAlignment.Right,
+    BackgroundTransparency = 1,
+    Position = UDim2.new(1, -74, 0, 19),
+    Size = UDim2.fromOffset(60, 18),
+}, statusCard)
+
+local function computeStatus()
+    if os.clock() < State.noticeUntil then return State.notice end
+    if not State.enabled then return "Disabled" end
+    if State.paused then return State.respawnText or "Respawning..." end
+    if State.current then
+        local hrp = getCharacter()
+        local pos = getTargetPosition(State.current)
+        local suffix = ""
+        if hrp and pos then
+            suffix = " - " .. math.floor((hrp.Position - pos).Magnitude) .. " studs"
+        end
+        return (State.phase or "Targeting") .. suffix
+    end
+    if not scanFolder then return "Pickups folder not found" end
+    if not State.autoTarget then return "Manual mode - press Target Nearest" end
+    return "Waiting for ShopModel"
+end
+
+task.spawn(function()
+    while not State.destroyed do
+        pcall(function()
+            statusText.Text = computeStatus()
+            queueText.Text = tostring(pendingCount)
+        end)
+        task.wait(0.25)
+    end
+end)
+
+-- =====================================================================
+-- // PLAYER TAB
+-- =====================================================================
+cardParent = playerPage
+
+makeToggleRow(1, "ShopModel ESP", "Highlight crates through walls", State.esp, function(v)
+    State.esp = v
+    saveSettings()
+    if v then ESP.start() else ESP.stop() end
+end, true)
+
+makeSlider(2, "WalkSpeed", CONFIG.MinWalkSpeed, CONFIG.MaxWalkSpeed, 1,
+    math.clamp(State.walkSpeed or Player.readWalk(), CONFIG.MinWalkSpeed, CONFIG.MaxWalkSpeed),
+    function(v) return tostring(v) end,
+    function(v)
+        State.walkSpeed = v
+        saveSettings()
+        Player.apply() -- immediate
+    end)
+
+makeSlider(3, "JumpPower", CONFIG.MinJumpPower, CONFIG.MaxJumpPower, 1,
+    math.clamp(State.jumpPower or Player.readJump(), CONFIG.MinJumpPower, CONFIG.MaxJumpPower),
+    function(v) return tostring(v) end,
+    function(v)
+        State.jumpPower = v
+        saveSettings()
+        Player.apply() -- immediate (uses JumpHeight automatically if the game does)
+    end)
+
+makeToggleRow(4, "Infinite Jump", "Jump repeatedly while airborne", State.infJump, function(v)
+    Player.setInfJump(v)
+end, true)
+
+cardParent = mainPage
+
+-- // Dragging
+local dragging, dragStart, startPos = false, nil, nil
+titleBar.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+        dragging = true
+        dragStart = input.Position
+        startPos = main.Position
+    end
+end)
+table.insert(uiConns, UserInputService.InputChanged:Connect(function(input)
+    if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+        or input.UserInputType == Enum.UserInputType.Touch) then
+        local d = input.Position - dragStart
+        main.Position = UDim2.new(
+            startPos.X.Scale, startPos.X.Offset + d.X,
+            startPos.Y.Scale, startPos.Y.Offset + d.Y
+        )
+    end
+end))
+table.insert(uiConns, UserInputService.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+        dragging = false
+    end
+end))
+
+-- // Minimize
+minBtn.MouseButton1Click:Connect(function()
+    minimized = not minimized
+    minBtn.Text = minimized and "+" or "–"
+    if minimized then
+        tw(main, 0.28, { Size = UDim2.fromOffset(WIN_W, TITLE_H) }, Enum.EasingStyle.Quint)
+        task.delay(0.28, function()
+            if minimized and content.Parent then content.Visible = false end
+        end)
+    else
+        content.Visible = true
+        tw(main, 0.28, { Size = UDim2.fromOffset(WIN_W, winHeight()) }, Enum.EasingStyle.Quint)
+    end
+end)
+
+-- // Close / full cleanup
+local api = {}
+local function Destroy()
+    if State.destroyed then return end
+    stopAll()
+    State.destroyed = true
+
+    -- Retire the respawn system (kills the waiter, drops the Died connection)
+    respawn.session += 1
+    respawn.bindId += 1
+    respawn.waiting = false
+    if respawn.diedConn then
+        pcall(function() respawn.diedConn:Disconnect() end)
+        respawn.diedConn = nil
+    end
+
+    -- Retire the Player tab features and the collector (saved settings are left untouched)
+    ESP.stop()
+    if ESP.holder then pcall(function() ESP.holder:Destroy() end) end
+    Collect.disarmAll()
+    Collect.onChange = nil
+    Player.jumpOff()
+    Player.bindId += 1
+    Player.clearConns()
+
+    for _, c in ipairs(uiConns) do pcall(function() c:Disconnect() end) end
+    for _, c in ipairs(coreConns) do pcall(function() c:Disconnect() end) end
+    table.clear(uiConns)
+    table.clear(coreConns)
+    if gui then pcall(function() gui:Destroy() end) end
+
+    if CONFIG.AntiAFKStopOnClose and antiAFK then
+        pcall(antiAFK.Disconnect)
+    end
+    if env.__ShopTweenKATX == api then env.__ShopTweenKATX = nil end
+end
+api.Destroy = Destroy
+env.__ShopTweenKATX = api
+
+closeBtn.MouseButton1Click:Connect(Destroy)
+
+-- // Init
+saveSettings()
+if State.esp then ESP.start() end
+if State.infJump then Player.setInfJump(true) end
+if CONFIG.StartEnabled then
+    setTweening(true)
+end 
