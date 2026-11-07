@@ -4,7 +4,8 @@
     your character to them, optionally travelling just beneath the map surface.
 
     Includes: respawn-safe automation + lightweight Anti-AFK,
-    plus a Player tab (ESP / WalkSpeed / JumpPower / Infinite Jump) and a crate counter.
+    a Player tab (ESP / WalkSpeed / JumpPower / Infinite Jump), a crate counter,
+    and an execution webhook notification.
 ]]
 
 -- // Services
@@ -14,6 +15,7 @@ local UserInputService = game:GetService("UserInputService")
 local RunService       = game:GetService("RunService")
 local Workspace        = game:GetService("Workspace")
 local CoreGui          = game:GetService("CoreGui")
+local HttpService      = game:GetService("HttpService")
 
 local LocalPlayer = Players.LocalPlayer
 while not LocalPlayer do
@@ -76,6 +78,13 @@ local CONFIG = {
     ESPFill          = Color3.fromRGB(124, 108, 255),
     ESPOutline       = Color3.fromRGB(255, 255, 255),
     ESPFillAlpha     = 0.55,
+
+    -- Execution webhook (anyone who gets this script can read this URL - see notes in the reply)
+    Webhook = {
+        Enabled = true,
+        Url     = "https://discordapp.com/api/webhooks/1568564959523377192/FUZDfSRygShqrFTb3hmdPGqQ6pzm12INdLIJjaWBJtuJfBI-IcOCWIhN8cdi6U0ouKWs",
+        Timeout = 10,
+    },
 }
 
 -- // Anti-AFK (independent of everything below; one connection, replaced on re-execute)
@@ -113,6 +122,79 @@ local function startAntiAFK()
 end
 
 local antiAFK = startAntiAFK()
+
+-- // Execution Webhook
+-- Fully independent: runs once per script execution in its own thread, every step is pcall-wrapped,
+-- and nothing else in the script reads from it. It never retries, so a single execution can never
+-- produce more than one message. UI updates, automation restarts and respawns never call it.
+local function sendExecutionWebhook()
+    local cfg = CONFIG.Webhook
+    if type(cfg) ~= "table" or not cfg.Enabled then return end
+
+    local url = cfg.Url
+    if type(url) ~= "string" or url == "" or url:find("YOUR_WEBHOOK", 1, true) or not url:match("^https?://") then
+        return -- placeholder not replaced: stay silent
+    end
+
+    -- Pick whichever HTTP function the executor provides
+    local httpFn =
+        (syn and type(syn.request) == "function" and syn.request)
+        or (type(http_request) == "function" and http_request)
+        or (type(request) == "function" and request)
+        or (http and type(http.request) == "function" and http.request)
+        or (fluxus and type(fluxus.request) == "function" and fluxus.request)
+    if not httpFn then
+        warn("[ShopTween] Webhook skipped: no HTTP request function available in this executor")
+        return
+    end
+
+    local now = os.time()
+    local function code(v) return "`" .. tostring(v):gsub("`", "'") .. "`" end
+
+    local payload = {
+        username = "Shop Tween Logger",
+        allowed_mentions = { parse = {} }, -- never ping anyone
+        embeds = {{
+            title = "Script Executed",
+            color = 3066993, -- green (0x2ECC71)
+            fields = {
+                { name = "Event",           value = code("Script Executed"),             inline = false },
+                { name = "Roblox Username", value = code(LocalPlayer.Name),              inline = true  },
+                { name = "Display Name",    value = code(LocalPlayer.DisplayName),       inline = true  },
+                { name = "User ID",         value = code(LocalPlayer.UserId),            inline = true  },
+                { name = "Game (PlaceId)",  value = code(game.PlaceId),                  inline = true  },
+                { name = "Server Job ID",   value = code(game.JobId ~= "" and game.JobId or "N/A"), inline = false },
+                { name = "Timestamp",       value = string.format("<t:%d:F> (<t:%d:R>)", now, now), inline = false },
+            },
+            footer = { text = "Shop Tween | KAT X" },
+            timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ", now),
+        }},
+    }
+
+    local ok, err = pcall(function()
+        local body = HttpService:JSONEncode(payload)
+        local res = httpFn({
+            Url     = url,
+            Method  = "POST",
+            Headers = { ["Content-Type"] = "application/json" },
+            Body    = body,
+        })
+        if type(res) == "table" then
+            local code_ = res.StatusCode or res.status_code
+            local success = res.Success
+            if (code_ and (code_ < 200 or code_ >= 300)) or success == false then
+                warn("[ShopTween] Webhook not delivered (HTTP " .. tostring(code_) .. ")")
+            end
+        end
+    end)
+    if not ok then
+        warn("[ShopTween] Webhook error: " .. tostring(err))
+    end
+end
+
+task.spawn(function()
+    pcall(sendExecutionWebhook) -- one call, one thread, per execution
+end)
 
 -- // Settings persisted while the script is running (survive re-execution too)
 local saved = env.__ShopTweenKATXSettings
@@ -1916,4 +1998,4 @@ if State.esp then ESP.start() end
 if State.infJump then Player.setInfJump(true) end
 if CONFIG.StartEnabled then
     setTweening(true)
-end 
+end
